@@ -41,3 +41,4 @@ uploads/
 
 # Playwright
 playwright-browsers/
+*.db
