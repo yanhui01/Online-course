@@ -329,6 +329,59 @@ class ZhihuishuAdapter(BasePlatformAdapter):
     async def get_course_progress(self, course_id: str) -> float:
         return 0.0
 
+    # ============================================================
+    # 扫码登录
+    # ============================================================
+
+    async def get_qrcode(self) -> str | None:
+        import base64, os
+        os.makedirs("screenshots", exist_ok=True)
+        try:
+            if not self._playwright:
+                self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self._headless,
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                )
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1366, "height": 768}, locale="zh-CN",
+                )
+                self._page = await self._context.new_page()
+
+            await self._page.goto("https://passport.zhihuishu.com/login", wait_until="domcontentloaded", timeout=10000)
+            await asyncio.sleep(3)
+
+            for tab_text in ["扫码登录", "微信登录", "二维码"]:
+                try:
+                    tab = self._page.locator(f'text="{tab_text}"').first
+                    if await tab.is_visible(timeout=1000):
+                        await tab.click()
+                        await asyncio.sleep(2)
+                        break
+                except Exception:
+                    continue
+
+            await self._page.screenshot(path=f"screenshots/zhihuishu_qrcode_{self._username}.png")
+            with open(f"screenshots/zhihuishu_qrcode_{self._username}.png", "rb") as f:
+                return base64.b64encode(f.read()).decode()
+        except Exception:
+            return None
+
+    async def wait_qrcode_scan(self, timeout: int = 120) -> bool:
+        if not self._page:
+            return False
+        start = asyncio.get_event_loop().time()
+        while (asyncio.get_event_loop().time() - start) < timeout:
+            await asyncio.sleep(2)
+            try:
+                body = (await self._page.text_content("body") or "")[:500]
+                if any(kw in body for kw in ["退出", "我的课程", "课程列表", "在线学堂", "个人中心"]):
+                    self._logged_in = True
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def close(self):
         try:
             if self._context: await self._context.close()

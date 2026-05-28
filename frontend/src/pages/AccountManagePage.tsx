@@ -3,6 +3,7 @@ import {
   Table,
   Button,
   Modal,
+  Tooltip,
   Form,
   Input,
   Select,
@@ -13,8 +14,9 @@ import {
   Typography,
   Radio,
 } from "antd";
-import { PlusOutlined, EditOutlined, DeleteOutlined, PhoneOutlined } from "@ant-design/icons";
+import { PlusOutlined, EditOutlined, DeleteOutlined, PhoneOutlined, ScanOutlined } from "@ant-design/icons";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import QrcodeLoginModal from "./QrcodeLoginModal";
 import {
   getAccountsApi,
   createAccountApi,
@@ -52,6 +54,10 @@ export default function AccountManagePage() {
   const [smsAccountId, setSmsAccountId] = useState<string>("");
   const [smsCode, setSmsCode] = useState("");
   const [smsSent, setSmsSent] = useState(false);
+  const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [qrAccountId, setQrAccountId] = useState("");
+  const [qrPlatform, setQrPlatform] = useState("");
+  const [qrAccountName, setQrAccountName] = useState("");
   const [form] = Form.useForm();
   const queryClient = useQueryClient();
   const { message } = App.useApp();
@@ -230,6 +236,20 @@ export default function AccountManagePage() {
               验证
             </Button>
           )}
+          <Tooltip title="免密码扫码登录">
+            <Button
+              type="link"
+              icon={<ScanOutlined />}
+              onClick={() => {
+                setQrAccountId(record.id);
+                setQrPlatform(record.platform);
+                setQrAccountName(record.account_name);
+                setQrModalOpen(true);
+              }}
+            >
+              扫码
+            </Button>
+          </Tooltip>
           <Button type="link" icon={<EditOutlined />} onClick={() => handleEdit(record)}>
             编辑
           </Button>
@@ -370,6 +390,20 @@ export default function AccountManagePage() {
           )}
         </div>
       </Modal>
+
+      {/* 扫码登录弹窗 */}
+      <QrcodeLoginModal
+        open={qrModalOpen}
+        accountId={qrAccountId}
+        platform={qrPlatform}
+        accountName={qrAccountName}
+        onSuccess={() => {
+          setQrModalOpen(false);
+          queryClient.invalidateQueries({ queryKey: ["accounts"] });
+          message.success("扫码登录成功，可以同步课程了");
+        }}
+        onCancel={() => setQrModalOpen(false)}
+      />
     </div>
   );
 }

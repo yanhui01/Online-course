@@ -55,6 +55,8 @@ async def sync_courses(
             platform=account.platform,
             account_name=account.account_name,
             encrypted_password=account.encrypted_password,
+            login_type=account.login_type,
+            cookie_data=account.cookie_data,
         )
     )
 
@@ -67,6 +69,8 @@ async def _do_sync(
     platform: str,
     account_name: str,
     encrypted_password: str | None,
+    login_type: str = "password",
+    cookie_data: str | None = None,
 ):
     """后台执行同步（独立的数据库会话）"""
     password = decrypt_optional(encrypted_password)
@@ -80,15 +84,29 @@ async def _do_sync(
     )
 
     try:
-        # 登录（最多等待 30 秒）
+        # 登录：SMS模式用Cookie恢复，密码模式走正常登录
         _sync_tasks[account_id] = {"status": "running", "message": "正在登录..."}
-        login_ok = await asyncio.wait_for(adapter.login(), timeout=90)
-        if not login_ok:
-            _sync_tasks[account_id] = {
-                "status": "error",
-                "message": f"{platform_label} 登录失败，请检查账号密码",
-            }
-            return
+
+        if login_type == "sms" and cookie_data:
+            decrypted_cookie = decrypt_optional(cookie_data)
+            cookie_ok = await adapter.load_cookies(decrypted_cookie or "")
+            if cookie_ok:
+                adapter._logged_in = True
+                _sync_tasks[account_id] = {"status": "running", "message": "Cookie登录成功，正在获取课程..."}
+            else:
+                _sync_tasks[account_id] = {
+                    "status": "error",
+                    "message": "Cookie 已过期，请重新验证短信",
+                }
+                return
+        else:
+            login_ok = await asyncio.wait_for(adapter.login(), timeout=90)
+            if not login_ok:
+                _sync_tasks[account_id] = {
+                    "status": "error",
+                    "message": f"{platform_label} 登录失败，请检查账号密码",
+                }
+                return
 
         # 获取课程（最多等待 30 秒）
         _sync_tasks[account_id] = {"status": "running", "message": "正在获取课程列表..."}

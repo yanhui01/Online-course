@@ -104,6 +104,28 @@ class BasePlatformAdapter(ABC):
         """导出 Cookie（JSON格式）"""
         return ""
 
+    async def get_qrcode(self) -> str | None:
+        """
+        获取登录二维码（base64 图片）
+        返回 base64 编码的 PNG 图片，失败返回 None
+        """
+        raise NotImplementedError(f"{self.platform_name} 不支持扫码登录")
+
+    async def wait_qrcode_scan(self, timeout: int = 120) -> bool:
+        """
+        等待用户扫码登录（阻塞最多 timeout 秒）
+        成功返回 True，超时返回 False
+        """
+        raise NotImplementedError(f"{self.platform_name} 不支持扫码登录")
+
+    async def export_cookies(self) -> str:
+        """导出 Cookie（JSON格式）"""
+        return ""
+
+    async def load_cookies(self, cookie_data: str) -> bool:
+        """加载 Cookie 恢复登录态，成功返回 True"""
+        return False
+
     @abstractmethod
     async def close(self):
         """关闭浏览器资源"""
