@@ -1,0 +1,105 @@
+version: "3.8"
+
+services:
+  # ============================================================
+  # PostgreSQL 数据库
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: oc-postgres
+    environment:
+      POSTGRES_DB: online_course
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # Redis 缓存 + 任务队列
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: oc-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================
+  # FastAPI 后端 API 服务
+  # ============================================================
+  backend:
+    build: ./backend
+    container_name: oc-backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - screenshots:/app/screenshots
+    restart: unless-stopped
+
+  # ============================================================
+  # ARQ Worker (Playwright 浏览器自动化执行节点)
+  # ============================================================
+  worker:
+    build: ./backend
+    container_name: oc-worker
+    command: arq app.worker.worker.WorkerSettings
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - screenshots:/app/screenshots
+    restart: unless-stopped
+
+  # ============================================================
+  # React 前端
+  # ============================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: oc-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redis_data:
+  screenshots:
