@@ -22,8 +22,8 @@ class XuetangxAdapter(BasePlatformAdapter):
     platform_name = "xuetangx"
 
     LOGIN_URLS = [
-        "https://www.xuetangx.com/login",
-        "https://www.xuetangx.com/",
+        "https://www.xuetangx.com/",       # 首页弹窗登录（更快）
+        "https://www.xuetangx.com/login",   # 独立登录页（备用）
     ]
     BASE_URL = "https://www.xuetangx.com"
 
@@ -68,7 +68,7 @@ class XuetangxAdapter(BasePlatformAdapter):
         for url in self.LOGIN_URLS:
             try:
                 print(f"[XUETANGX] 尝试打开: {url}")
-                await self._page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await self._page.goto(url, wait_until="domcontentloaded", timeout=8000)
                 await asyncio.sleep(3)
 
                 await self._page.screenshot(path=f"screenshots/xuetangx_page_{self._username}.png")
@@ -114,22 +114,22 @@ class XuetangxAdapter(BasePlatformAdapter):
             # 检查是否弹出了登录弹窗
             body_text = (await self._page.text_content("body") or "")[:1000]
 
-        # 判断是否有密码登录 tab 需要切换
-        if "短信登录" in body_text or "验证码登录" in body_text:
-            for tab_text in ["密码登录", "账号密码", "密码"]:
-                try:
-                    tab = self._page.locator(f'text="{tab_text}"').first
-                    if await tab.is_visible(timeout=1000):
-                        await tab.click()
-                        await asyncio.sleep(2)
-                        print("[XUETANGX] 切换到密码登录")
-                        break
-                except Exception:
-                    continue
+        # 优先切换到"密码登录"tab
+        for tab_text in ["密码登录", "密码", "账号密码"]:
+            try:
+                tab = self._page.locator(f'text="{tab_text}"').first
+                if await tab.is_visible(timeout=500):
+                    await tab.click()
+                    await asyncio.sleep(1)
+                    print(f"[XUETANGX] 切换到密码登录 tab")
+                    break
+            except Exception:
+                continue
 
         # 截图看登录弹窗
         await self._page.screenshot(path=f"screenshots/xuetangx_login_modal_{self._username}.png")
 
+        # 重新获取输入框（tab切换后SMS字段可能隐藏）
         all_inputs = await self._page.locator("input").all()
         print(f"[XUETANGX] 找到 {len(all_inputs)} 个 input")
 
@@ -138,22 +138,24 @@ class XuetangxAdapter(BasePlatformAdapter):
                 t = (await inp.get_attribute("type") or "").lower()
                 ph = (await inp.get_attribute("placeholder") or "")
                 nm = (await inp.get_attribute("name") or "")
-                print(f"  input[{i}]: type={t}, name={nm}, placeholder={ph}")
+                visible = await inp.is_visible()
+                print(f"  input[{i}]: type={t}, name={nm}, placeholder={ph}, visible={visible}")
             except Exception:
                 pass
 
-        # 填写用户名：优先找"手机号"输入框（跳过验证码输入框）
+        # 填写用户名：只找可见的、非验证码的手机号输入框
         username_filled = False
         for inp in all_inputs:
             try:
+                if not await inp.is_visible():
+                    continue
                 t = (await inp.get_attribute("type") or "").lower()
                 ph = (await inp.get_attribute("placeholder") or "").lower()
                 nm = (await inp.get_attribute("name") or "").lower()
-                # 跳过验证码输入框
-                if any(kw in ph for kw in ["验证码", "code", "sms", "验证"]):
+                if any(kw in ph for kw in ["验证码", "code", "sms"]):
                     continue
                 if t in ("text", "tel", "email", "") and any(
-                    kw in ph + nm for kw in ["手机", "mobile", "phone", "邮箱", "email", "账号", "account", "username", "用户名"]
+                    kw in ph + nm for kw in ["手机", "mobile", "phone", "邮箱", "email", "账号", "account", "username"]
                 ):
                     await inp.click()
                     await inp.fill(self._username)
@@ -166,14 +168,16 @@ class XuetangxAdapter(BasePlatformAdapter):
         if not username_filled:
             for inp in all_inputs:
                 try:
+                    if not await inp.is_visible():
+                        continue
                     t = (await inp.get_attribute("type") or "").lower()
                     ph = (await inp.get_attribute("placeholder") or "").lower()
-                    if any(kw in ph for kw in ["搜索", "search", "找", "验证码", "code", "sms", "验证", "邮箱"]):
+                    if any(kw in ph for kw in ["搜索", "search", "验证码", "code", "sms", "邮箱"]):
                         continue
                     if t in ("text", "tel", ""):
                         await inp.click()
                         await inp.fill(self._username)
-                        print(f"[XUETANGX] 降级填写用户名 placeholder={ph}")
+                        print(f"[XUETANGX] 降级填写: placeholder={ph}")
                         username_filled = True
                         break
                 except Exception:
@@ -185,22 +189,63 @@ class XuetangxAdapter(BasePlatformAdapter):
 
         await human_wait(300, 150)
 
-        # 填写密码：找到第一个可见的密码输入框
+        # 填写密码：只找可见的密码输入框
         password_filled = False
         for inp in all_inputs:
             try:
+                if not await inp.is_visible():
+                    continue
                 if (await inp.get_attribute("type") or "").lower() == "password":
                     ph = (await inp.get_attribute("placeholder") or "").lower()
-                    # 跳过"确认密码"
                     if "确认" in ph:
                         continue
                     await inp.click()
                     await inp.fill(self._password)
-                    print(f"[XUETANGX] 填写密码 placeholder={ph}")
+                    print(f"[XUETANGX] 填写密码: placeholder={ph}")
                     password_filled = True
                     break
             except Exception:
                 continue
+
+        if not password_filled:
+            # 学堂在线可能是分步登录：先填邮箱/手机号 → 点"下一步" → 再输密码
+            print("[XUETANGX] 未找到密码框，尝试分步登录...")
+            next_clicked = False
+            for selector in [
+                'button:has-text("下一步")', 'button:has-text("继续")',
+                'button:has-text("Next")', 'button[type="submit"]', 'button',
+            ]:
+                try:
+                    btn = self._page.locator(selector).first
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click()
+                        next_clicked = True
+                        print(f"[XUETANGX] 点击下一步")
+                        break
+                except Exception:
+                    continue
+            if not next_clicked:
+                await self._page.keyboard.press("Enter")
+
+            await asyncio.sleep(3)
+
+            # 重新获取输入框（密码框应该可见了）
+            all_inputs = await self._page.locator("input").all()
+            for inp in all_inputs:
+                try:
+                    if not await inp.is_visible():
+                        continue
+                    if (await inp.get_attribute("type") or "").lower() == "password":
+                        ph = (await inp.get_attribute("placeholder") or "").lower()
+                        if "确认" in ph:
+                            continue
+                        await inp.click()
+                        await inp.fill(self._password)
+                        print(f"[XUETANGX] 填写密码: {ph}")
+                        password_filled = True
+                        break
+                except Exception:
+                    continue
 
         if not password_filled:
             return False
@@ -267,7 +312,7 @@ class XuetangxAdapter(BasePlatformAdapter):
         return "登录" not in body_text[:200]
 
     async def send_sms_code(self) -> bool:
-        """发送短信验证码（学堂在线支持手机验证码登录）"""
+        """发送短信验证码 — 打开首页弹窗 → 切短信tab → 填手机号 → 点发送"""
         if not self._playwright:
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch(
@@ -283,43 +328,71 @@ class XuetangxAdapter(BasePlatformAdapter):
                 window.chrome = { runtime: {} };
             """)
             self._page = await self._context.new_page()
+        os.makedirs("screenshots", exist_ok=True)
 
         try:
-            await self._page.goto("https://www.xuetangx.com/login", wait_until="domcontentloaded", timeout=15000)
+            # 1. 打开首页
+            await self._page.goto("https://www.xuetangx.com/", wait_until="domcontentloaded", timeout=10000)
+            await asyncio.sleep(2)
+
+            # 2. 点击登录按钮打开弹窗
+            for btn_text in ["登录", "登录/注册"]:
+                try:
+                    btn = self._page.locator(f'text="{btn_text}"').first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        print(f"[XUETANGX-SMS] 点击了登录入口")
+                        break
+                except Exception:
+                    continue
             await asyncio.sleep(3)
 
-            # 切换到短信验证码登录
-            for tab_text in ["短信登录", "验证码登录", "手机验证码"]:
+            # 3. 切换到短信验证码登录 tab
+            for tab_text in ["短信登录", "验证码登录", "手机验证码", "短信"]:
                 try:
                     tab = self._page.locator(f'text="{tab_text}"').first
-                    if await tab.is_visible(timeout=1000):
+                    if await tab.is_visible(timeout=500):
                         await tab.click()
                         await asyncio.sleep(1)
-                        print(f"[XUETANGX] 切换到短信登录")
+                        print(f"[XUETANGX-SMS] 切换到短信登录 tab")
                         break
                 except Exception:
                     continue
 
-            # 填写手机号
+            await self._page.screenshot(path=f"screenshots/xuetangx_sms_{self._username}.png")
+
+            # 4. 填写手机号（只找可见的）
             all_inputs = await self._page.locator("input").all()
+            phone_filled = False
             for inp in all_inputs:
                 try:
+                    if not await inp.is_visible():
+                        continue
                     ph = (await inp.get_attribute("placeholder") or "").lower()
                     if any(kw in ph for kw in ["手机", "mobile", "phone"]):
                         await inp.click()
-                        for char in self._username:
-                            await inp.type(char, delay=random_delay(50, 30) * 1000)
+                        await inp.fill(self._username)
+                        print(f"[XUETANGX-SMS] 填写手机号: {self._username}")
+                        phone_filled = True
                         break
                 except Exception:
                     continue
 
-            # 点击发送验证码
-            for btn_text in ["获取验证码", "发送验证码", "获取"]:
+            if not phone_filled:
+                print("[XUETANGX-SMS] 未找到可见的手机号输入框")
+                return False
+
+            await human_wait(200, 100)
+
+            # 5. 点击发送验证码
+            for btn_text in ["获取验证码", "发送验证码", "获取", "发送"]:
                 try:
-                    btn = self._page.locator(f'text="{btn_text}"').first
-                    if await btn.is_visible(timeout=1000):
+                    btn = self._page.locator(f'button:has-text("{btn_text}")').first
+                    if not await btn.is_visible(timeout=500):
+                        btn = self._page.locator(f'text="{btn_text}"').first
+                    if await btn.is_visible(timeout=500):
                         await btn.click()
-                        print(f"[XUETANGX] 已点击发送验证码")
+                        print(f"[XUETANGX-SMS] 已点击发送验证码")
                         return True
                 except Exception:
                     continue
@@ -327,33 +400,56 @@ class XuetangxAdapter(BasePlatformAdapter):
             return False
 
         except Exception as e:
-            print(f"[XUETANGX] 发送短信失败: {e}")
+            print(f"[XUETANGX-SMS] 发送短信失败: {e}")
             return False
 
     async def login_with_sms(self, sms_code: str) -> bool:
-        """使用短信验证码完成登录"""
+        """输入短信验证码完成登录"""
         if not self._page:
             raise RuntimeError("请先调用 send_sms_code()")
 
+        # 填写验证码（只找可见的）
         all_inputs = await self._page.locator("input").all()
         for inp in all_inputs:
             try:
+                if not await inp.is_visible():
+                    continue
                 ph = (await inp.get_attribute("placeholder") or "").lower()
                 if any(kw in ph for kw in ["验证码", "code", "sms"]):
                     await inp.click()
                     await inp.fill(sms_code)
-                    print("[XUETANGX] 填写验证码")
+                    print(f"[XUETANGX-SMS] 填写验证码")
                     break
             except Exception:
                 continue
 
-        await self._page.keyboard.press("Enter")
+        # 点登录按钮
+        for selector in ['button:has-text("登录")', 'button[type="submit"]', 'button']:
+            try:
+                btn = self._page.locator(selector).first
+                if await btn.is_visible(timeout=1000):
+                    await btn.click()
+                    break
+            except Exception:
+                continue
+
         await asyncio.sleep(4)
+        await self._page.screenshot(path=f"screenshots/xuetangx_sms_result_{self._username}.png")
 
         body_text = (await self._page.text_content("body") or "")[:500]
-        if "密码错误" in body_text or "验证码错误" in body_text:
+        if "验证码错误" in body_text or "验证码不正确" in body_text:
+            print("[XUETANGX-SMS] 验证码错误")
             return False
 
+        # 检查登录成功
+        current_url = self._page.url
+        success_kw = ["退出", "我的课程", "个人中心", "学习中心", "已登录"]
+        if any(kw in body_text for kw in success_kw) or ("xuetangx" in current_url and "login" not in current_url):
+            self._logged_in = True
+            print(f"[XUETANGX-SMS] 短信登录成功! URL={current_url}")
+            return True
+
+        # 没有明显错误就乐观认为成功
         self._logged_in = True
         return True
 

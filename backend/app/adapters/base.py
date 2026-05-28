@@ -92,6 +92,18 @@ class BasePlatformAdapter(ABC):
         """获取课程完成百分比"""
         ...
 
+    async def send_sms_code(self) -> bool:
+        """发送短信验证码（子类可选实现）"""
+        raise NotImplementedError(f"{self.platform_name} 不支持短信验证码")
+
+    async def login_with_sms(self, sms_code: str) -> bool:
+        """短信验证码登录（子类可选实现）"""
+        raise NotImplementedError(f"{self.platform_name} 不支持短信验证码")
+
+    async def export_cookies(self) -> str:
+        """导出 Cookie（JSON格式）"""
+        return ""
+
     @abstractmethod
     async def close(self):
         """关闭浏览器资源"""

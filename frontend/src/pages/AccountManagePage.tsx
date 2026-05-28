@@ -63,11 +63,20 @@ export default function AccountManagePage() {
 
   const createMutation = useMutation({
     mutationFn: createAccountApi,
-    onSuccess: () => {
-      message.success("添加成功");
+    onSuccess: (data: PlatformAccount, variables: CreateAccountParams) => {
       setModalOpen(false);
       form.resetFields();
       queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      // SMS 模式自动弹出验证码对话框
+      if (variables.login_type === "sms") {
+        message.info("账号已添加，请验证手机号");
+        setSmsAccountId(data.id);
+        setSmsCode("");
+        setSmsSent(false);
+        setSmsModalOpen(true);
+      } else {
+        message.success("添加成功");
+      }
     },
     onError: (err: any) => {
       message.error(err.response?.data?.detail || "添加失败");
@@ -161,6 +170,8 @@ export default function AccountManagePage() {
     setSmsCode("");
     setSmsSent(false);
     setSmsModalOpen(true);
+    // 自动触发发送验证码
+    sendSmsMutation.mutate(record.id);
   };
 
   const loginTypeValue = Form.useWatch("login_type", form);

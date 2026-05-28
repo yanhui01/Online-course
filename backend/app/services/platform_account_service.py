@@ -1,9 +1,12 @@
 """平台账号服务"""
 
+from datetime import datetime, timezone
+
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.factory import get_adapter
 from app.core.crypto import decrypt, encrypt, encrypt_optional
 from app.models.platform_account import PlatformAccount
 from app.schemas.platform_account import (
@@ -113,23 +116,32 @@ async def get_decrypted_password(db: AsyncSession, user_id: str, account_id: str
 
 async def send_sms_code(db: AsyncSession, user_id: str, account_id: str) -> dict:
     """
-    触发学堂在线发送短信验证码
+    触发平台发送短信验证码（支持学堂在线等）
     通过 Playwright 打开登录页，点击"发送验证码"按钮
     """
     account = await _get_owned_account(db, user_id, account_id)
 
-    if account.platform != "xuetangx":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="仅学堂在线支持短信验证码登录",
-        )
-
-    # TODO: 调用 XuetangX 适配器发送短信
-    # adapter = XuetangxAdapter(account.account_name, "", headless=True)
-    # await adapter.send_sms_code()
+    adapter = get_adapter(
+        platform=account.platform,
+        username=account.account_name,
+        password="",
+        headless=True,
+    )
+    try:
+        success = await adapter.send_sms_code()
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="发送验证码失败，请确认手机号正确且平台可访问",
+            )
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
 
     return {
-        "message": "验证码已发送",
+        "message": "验证码已发送，请查收手机短信",
         "phone": account.account_name,
     }
 
@@ -138,32 +150,42 @@ async def verify_sms_login(
     db: AsyncSession, user_id: str, account_id: str, sms_code: str
 ) -> dict:
     """
-    验证短信验证码并登录学堂在线，保存 cookie
+    验证短信验证码并登录，保存 cookie 和登录态
     """
     account = await _get_owned_account(db, user_id, account_id)
 
-    if account.platform != "xuetangx":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="仅学堂在线支持短信验证码登录",
-        )
+    adapter = get_adapter(
+        platform=account.platform,
+        username=account.account_name,
+        password="",
+        headless=True,
+    )
+    try:
+        # 先发送验证码（如果还没发送）- 这里直接验证
+        success = await adapter.login_with_sms(sms_code)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="验证码错误或已过期",
+            )
 
-    # TODO: 调用 XuetangX 适配器验证登录
-    # adapter = XuetangxAdapter(account.account_name, "", headless=True)
-    # success = await adapter.login_with_sms(sms_code)
-    #
-    # if not success:
-    #     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="验证码错误或已过期")
-    #
-    # account.cookie_data = encrypt(await adapter.export_cookies())
-    # account.is_valid = True
-    # account.last_login_at = datetime.now(timezone.utc)
-    # await db.commit()
+        # 保存 cookie 供后续同步课程使用
+        cookie_data = await adapter.export_cookies()
+        if cookie_data:
+            account.cookie_data = encrypt(cookie_data)
+        account.is_valid = True
+        account.last_login_at = datetime.now(timezone.utc)
+        await db.commit()
 
-    return {
-        "message": "验证成功",
-        "account_id": account_id,
-    }
+        return {
+            "message": "短信验证成功，已保存登录态",
+            "account_id": account_id,
+        }
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
 
 
 async def _get_owned_account(

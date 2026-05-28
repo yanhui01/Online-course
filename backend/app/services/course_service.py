@@ -82,7 +82,7 @@ async def _do_sync(
     try:
         # 登录（最多等待 30 秒）
         _sync_tasks[account_id] = {"status": "running", "message": "正在登录..."}
-        login_ok = await asyncio.wait_for(adapter.login(), timeout=45)
+        login_ok = await asyncio.wait_for(adapter.login(), timeout=90)
         if not login_ok:
             _sync_tasks[account_id] = {
                 "status": "error",
