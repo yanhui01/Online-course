@@ -91,18 +91,44 @@ class XuetangxAdapter(BasePlatformAdapter):
 
     async def _try_login(self) -> bool:
         """在当前页面尝试密码登录"""
-        # 学堂在线登录页：手机号/邮箱 + 密码，或者切换到密码登录 tab
-        # 先检查是否有"密码登录"的切换按钮
-        for tab_text in ["密码登录", "账号密码", "密码"]:
-            try:
-                tab = self._page.locator(f'text="{tab_text}"').first
-                if await tab.is_visible(timeout=1000):
-                    await tab.click()
-                    await asyncio.sleep(1)
-                    print(f"[XUETANGX] 切换到密码登录")
-                    break
-            except Exception:
-                continue
+        body_text = (await self._page.text_content("body") or "")[:1000]
+
+        # 判断当前是首页还是登录页
+        is_homepage = any(kw in body_text for kw in ["首页", "合作院校", "全部课程", "精品课程"])
+        is_login_page = any(kw in body_text for kw in ["密码登录", "短信登录", "验证码登录"])
+
+        # 如果是首页，点击登录按钮打开弹窗
+        if is_homepage and not is_login_page:
+            print("[XUETANGX] 当前为首页，查找登录入口...")
+            for btn_text in ["登录", "登录/注册", "登 录", "Sign in"]:
+                try:
+                    btn = self._page.locator(f'text="{btn_text}"').first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        print(f"[XUETANGX] 点击了登录入口")
+                        await asyncio.sleep(3)
+                        break
+                except Exception:
+                    continue
+
+            # 检查是否弹出了登录弹窗
+            body_text = (await self._page.text_content("body") or "")[:1000]
+
+        # 判断是否有密码登录 tab 需要切换
+        if "短信登录" in body_text or "验证码登录" in body_text:
+            for tab_text in ["密码登录", "账号密码", "密码"]:
+                try:
+                    tab = self._page.locator(f'text="{tab_text}"').first
+                    if await tab.is_visible(timeout=1000):
+                        await tab.click()
+                        await asyncio.sleep(2)
+                        print("[XUETANGX] 切换到密码登录")
+                        break
+                except Exception:
+                    continue
+
+        # 截图看登录弹窗
+        await self._page.screenshot(path=f"screenshots/xuetangx_login_modal_{self._username}.png")
 
         all_inputs = await self._page.locator("input").all()
         print(f"[XUETANGX] 找到 {len(all_inputs)} 个 input")
@@ -116,13 +142,16 @@ class XuetangxAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        # 填写用户名
+        # 填写用户名：优先找"手机号"输入框（跳过验证码输入框）
         username_filled = False
         for inp in all_inputs:
             try:
                 t = (await inp.get_attribute("type") or "").lower()
                 ph = (await inp.get_attribute("placeholder") or "").lower()
                 nm = (await inp.get_attribute("name") or "").lower()
+                # 跳过验证码输入框
+                if any(kw in ph for kw in ["验证码", "code", "sms", "验证"]):
+                    continue
                 if t in ("text", "tel", "email", "") and any(
                     kw in ph + nm for kw in ["手机", "mobile", "phone", "邮箱", "email", "账号", "account", "username", "用户名"]
                 ):
@@ -138,28 +167,36 @@ class XuetangxAdapter(BasePlatformAdapter):
             for inp in all_inputs:
                 try:
                     t = (await inp.get_attribute("type") or "").lower()
-                    if t in ("text", "tel", "email", ""):
+                    ph = (await inp.get_attribute("placeholder") or "").lower()
+                    if any(kw in ph for kw in ["搜索", "search", "找", "验证码", "code", "sms", "验证", "邮箱"]):
+                        continue
+                    if t in ("text", "tel", ""):
                         await inp.click()
                         await inp.fill(self._username)
-                        print("[XUETANGX] 降级填写用户名")
+                        print(f"[XUETANGX] 降级填写用户名 placeholder={ph}")
                         username_filled = True
                         break
                 except Exception:
                     continue
 
         if not username_filled:
+            print("[XUETANGX] 未找到用户名输入框")
             return False
 
         await human_wait(300, 150)
 
-        # 填写密码
+        # 填写密码：找到第一个可见的密码输入框
         password_filled = False
         for inp in all_inputs:
             try:
                 if (await inp.get_attribute("type") or "").lower() == "password":
+                    ph = (await inp.get_attribute("placeholder") or "").lower()
+                    # 跳过"确认密码"
+                    if "确认" in ph:
+                        continue
                     await inp.click()
                     await inp.fill(self._password)
-                    print("[XUETANGX] 填写密码")
+                    print(f"[XUETANGX] 填写密码 placeholder={ph}")
                     password_filled = True
                     break
             except Exception:
@@ -194,21 +231,38 @@ class XuetangxAdapter(BasePlatformAdapter):
         await self._page.screenshot(path=f"screenshots/xuetangx_after_login_{self._username}.png")
 
         current_url = self._page.url
-        body_text = (await self._page.text_content("body") or "")[:500]
+        body_text = (await self._page.text_content("body") or "")[:800]
 
-        for kw in ["密码错误", "账号不存在", "验证码", "登录失败"]:
-            if kw in body_text:
-                print(f"[XUETANGX] 登录失败: {kw}")
+        print(f"[XUETANGX] 登录后 URL={current_url}")
+        print(f"[XUETANGX] 登录后 body预览={body_text[:200]}")
+
+        for kw in ["密码错误", "账号不存在", "验证码", "登录失败", "密码不正确",
+                     "账号或密码", "用户名或密码", "请重新输入", "incorrect",
+                     "invalid", "wrong password"]:
+            if kw.lower() in body_text.lower():
+                print(f"[XUETANGX] 登录失败: 检测到 '{kw}'")
                 return False
 
-        success_indicators = ["退出", "我的课程", "课程列表", "个人中心", "dashboard", "学习中心"]
+        # 检查是否还在登录弹窗（说明登录没成功）
+        if any(kw in body_text[:300] for kw in ["手机号登录", "短信登录", "密码登录"]):
+            print("[XUETANGX] 仍在登录弹窗中，登录可能失败")
+            return False
+
+        success_indicators = [
+            "退出", "我的课程", "课程列表", "个人中心", "dashboard",
+            "学习中心", "我的主页", "已登录",
+        ]
         if any(kw in body_text for kw in success_indicators):
             print(f"[XUETANGX] 登录成功: {current_url}")
             return True
 
-        if "xuetangx" in current_url:
-            print(f"[XUETANGX] URL 变化，假定成功: {current_url}")
-            return True
+        if any(domain in current_url for domain in ["xuetangx.com", "next.xuetangx.com"]):
+            if "login" not in current_url.lower():
+                print(f"[XUETANGX] 已跳转到非登录页，假定成功: {current_url}")
+                return True
+            else:
+                # 还在登录页，检查是否有错误
+                return False
 
         return "登录" not in body_text[:200]
 
@@ -315,37 +369,62 @@ class XuetangxAdapter(BasePlatformAdapter):
 
         courses = []
         try:
+            # 学堂在线的课程入口：
+            # 1. 个人主页(需要先切过去)
+            # 2. 学习中心
             course_urls = [
-                "https://www.xuetangx.com/courses",
+                self._page.url,  # 保持登录后的当前页面（通常就是个人主页或学习中心）
                 "https://www.xuetangx.com/dashboard",
+                "https://www.xuetangx.com/student/dashboard",
+                "https://www.xuetangx.com/courses",
+                "https://www.xuetangx.com/my-courses",
+                "https://next.xuetangx.com/courses",
+                "https://next.xuetangx.com/dashboard",
             ]
             for url in course_urls:
                 try:
                     await self._page.goto(url, wait_until="domcontentloaded", timeout=10000)
-                    await asyncio.sleep(3)
-                    break
+                    await asyncio.sleep(4)  # SPA 渲染
+                    body_len = len((await self._page.text_content("body") or ""))
+                    print(f"[XUETANGX] 课程页 {url} body长度={body_len}")
+                    if body_len > 500:
+                        break
                 except Exception:
                     continue
 
             await self._page.screenshot(path=f"screenshots/xuetangx_courses_{self._username}.png")
 
+            # 诊断：打印页面上的可见文本
+            body_text = (await self._page.text_content("body") or "")[:800]
+            print(f"[XUETANGX] 页面文本: {body_text[:300]}...")
+
+            # JS 批量提取课程（使用更多选择器）
             courses_raw = await self._page.evaluate("""
                 () => {
                     const courses = [];
-                    const cards = document.querySelectorAll(
-                        '[class*="course"]:not([class*="nav"]):not([class*="header"]):not([class*="footer"])'
+                    // 学堂在线可能使用的 class 名称
+                    let cards = document.querySelectorAll(
+                        '.course-card, .course-item, .courseItem, ' +
+                        '[class*="course-card"], [class*="courseCard"], ' +
+                        '[class*="course-item"], [class*="courseItem"], ' +
+                        '.card, [class*="card"], ' +
+                        'a[href*="/course/"], a[href*="/learn/"], ' +
+                        '[class*="list"] > div, [class*="grid"] > div'
                     );
+                    console.log('course cards found:', cards.length);
                     cards.forEach((card, idx) => {
                         const text = (card.innerText || card.textContent || '').trim();
                         const lines = text.split('\\n').filter(l => l.trim());
                         if (!text || text.length < 4) return;
 
                         let name = '';
-                        const h3 = card.querySelector('h3, h4, h5, [class*="title"], [class*="name"]');
-                        if (h3) name = h3.innerText.trim();
+                        const titleEl = card.querySelector(
+                            'h3, h4, h5, h2, .title, .name, [class*="title"], [class*="name"], strong, b'
+                        );
+                        if (titleEl) name = titleEl.innerText.trim();
                         if (!name && lines.length > 0) {
                             for (const l of lines) {
-                                if (l.length >= 4 && !/进行|已学|完成|继续|进入/.test(l)) {
+                                if (l.length >= 4 && !/进行|已学|完成|继续|进入|免费|报名/.test(l)) {
                                     name = l; break;
                                 }
                             }
@@ -353,7 +432,10 @@ class XuetangxAdapter(BasePlatformAdapter):
                         }
 
                         let teacher = '';
-                        const tEl = card.querySelector('[class*="teacher"], [class*="author"], [class*="university"]');
+                        const tEl = card.querySelector(
+                            '[class*="teacher"], [class*="author"], [class*="university"], ' +
+                            '[class*="school"], [class*="org"]'
+                        );
                         if (tEl) teacher = tEl.innerText.trim();
                         if (!teacher && lines.length >= 2) {
                             for (const l of lines.slice(1)) {
@@ -362,10 +444,12 @@ class XuetangxAdapter(BasePlatformAdapter):
                         }
 
                         let courseId = 'xuetangx_' + idx;
-                        const link = card.querySelector('a[href]');
+                        const link = card.tagName === 'A' ? card : card.querySelector('a[href]');
                         if (link) {
                             const href = link.getAttribute('href') || '';
-                            const m = href.match(/\\/course\\/([^/?]+)/);
+                            let m = href.match(/\\/course\\/([^/?]+)/);
+                            if (!m) m = href.match(/\\/learn\\/([^/?]+)/);
+                            if (!m) m = href.match(/courseId=([^&]+)/);
                             if (m) courseId = m[1];
                         }
 
@@ -373,8 +457,9 @@ class XuetangxAdapter(BasePlatformAdapter):
                         const img = card.querySelector('img');
                         if (img) coverUrl = img.getAttribute('src') || '';
 
-                        courses.push({ name, teacher, courseId, coverUrl });
+                        if (name) courses.push({ name, teacher, courseId, coverUrl });
                     });
+                    // 去重
                     const seen = new Set();
                     return courses.filter(c => {
                         const key = c.name + c.teacher;
