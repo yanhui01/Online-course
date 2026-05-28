@@ -208,4 +208,84 @@ async def get_course_detail(db: AsyncSession, user_id: str, course_id: str) -> C
 
     resp = CourseDetailResponse.model_validate(course)
     resp.sections = [SectionResponse.model_validate(s) for s in sections]
+
+    # 章节为空时，异步触发同步
+    if not sections:
+        account_result = await db.execute(
+            select(PlatformAccount).where(PlatformAccount.id == course.account_id)
+        )
+        account = account_result.scalar_one_or_none()
+        if account:
+            asyncio.create_task(
+                _sync_sections(
+                    course_id=course_id,
+                    platform=course.platform,
+                    platform_course_id=course.platform_course_id,
+                    account_name=account.account_name,
+                    encrypted_password=account.encrypted_password,
+                )
+            )
+
     return resp
+
+
+async def _sync_sections(
+    course_id: str,
+    platform: str,
+    platform_course_id: str,
+    account_name: str,
+    encrypted_password: str | None,
+):
+    """后台同步单个课程的章节"""
+    password = decrypt_optional(encrypted_password)
+    adapter = get_adapter(platform=platform, username=account_name, password=password or "")
+
+    try:
+        await asyncio.wait_for(adapter.login(), timeout=30)
+        sections_infos = await asyncio.wait_for(
+            adapter.get_sections(platform_course_id), timeout=30
+        )
+
+        if sections_infos:
+            async with async_session_factory() as db:
+                for idx, sec in enumerate(sections_infos):
+                    existing = await db.execute(
+                        select(CourseSection).where(
+                            CourseSection.course_id == course_id,
+                            CourseSection.platform_section_id == sec.platform_section_id,
+                        )
+                    )
+                    if existing.scalar_one_or_none() is None:
+                        db.add(CourseSection(
+                            course_id=course_id,
+                            platform_section_id=sec.platform_section_id,
+                            name=sec.name,
+                            section_type=sec.section_type,
+                            duration_minutes=sec.duration_minutes,
+                            sort_order=idx,
+                            is_completed=sec.is_completed,
+                        ))
+
+                # 更新课程章节计数
+                count_r = await db.execute(
+                    select(func.count()).select_from(CourseSection).where(
+                        CourseSection.course_id == course_id
+                    )
+                )
+                course = await db.get(Course, course_id)
+                if course:
+                    course.total_sections = count_r.scalar() or 0
+                await db.commit()
+                print(f"[sync_sections] 同步了 {len(sections_infos)} 个章节")
+
+    except asyncio.TimeoutError:
+        print(f"[sync_sections] 章节同步超时")
+    except NotImplementedError:
+        print(f"[sync_sections] 章节同步未实现")
+    except Exception as e:
+        print(f"[sync_sections] 异常: {e}")
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
