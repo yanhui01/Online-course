@@ -22,7 +22,9 @@
       "Bash(taskkill:*)",
       "Bash(gh repo:*)",
       "Bash(curl -s \"https://api.github.com/repos/yanhui01/Online-course\")",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:mooc.icve.com.cn)",
+      "Bash(curl:*)"
     ]
   }
 }

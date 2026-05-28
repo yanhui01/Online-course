@@ -17,9 +17,17 @@ async def sync_courses(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """从平台同步课程列表"""
-    courses = await course_service.sync_courses(db, user_id, data.account_id)
-    return {"items": courses, "total": len(courses)}
+    """启动后台同步任务（立即返回）"""
+    return await course_service.sync_courses(db, user_id, data.account_id)
+
+
+@router.get("/sync-status/{account_id}")
+async def get_sync_status(account_id: str):
+    """查询同步任务进度"""
+    status = course_service.get_sync_status(account_id)
+    if status is None:
+        return {"status": "idle", "message": "未找到同步任务"}
+    return status
 
 
 @router.get("")
