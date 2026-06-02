@@ -1,11 +1,13 @@
 """智慧职教 (icve.com.cn) 平台适配器 — Playwright 浏览器自动化实现"""
 
 import asyncio
+import base64
 import json
 import os
 import re
 from typing import AsyncIterator, List, Optional
 
+import ddddocr
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright._impl._errors import TimeoutError as PlaywrightTimeout
 
@@ -44,7 +46,7 @@ class IcveAdapter(BasePlatformAdapter):
     # ============================================================
 
     async def login(self) -> bool:
-        """登录智慧职教"""
+        """登录智慧职教（直接访问登录页面）"""
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self._headless,
@@ -80,89 +82,42 @@ class IcveAdapter(BasePlatformAdapter):
         """)
 
         self._page = await self._context.new_page()
+        os.makedirs("screenshots", exist_ok=True)
 
-        # 尝试多个登录 URL，看哪个能打开
-        for url in self.LOGIN_URLS:
-            try:
-                print(f"[ICVE] 尝试打开: {url}")
-                await self._page.goto(url, wait_until="domcontentloaded", timeout=10000)
-                await asyncio.sleep(3)  # 等待 SPA 渲染
-
-                # 截个图用于诊断
-                os.makedirs("screenshots", exist_ok=True)
-                await self._page.screenshot(path=f"screenshots/icve_page_{self._username}.png")
-
-                # 获取渲染后的页面文本
-                page_text = await self._page.text_content("body") or ""
-                page_text = page_text[:2000]
-                print(f"[ICVE] 页面内容预览: {page_text[:300]}...")
-
-                if await self._try_login():
-                    self._logged_in = True
-                    return True
-
-            except PlaywrightTimeout:
-                print(f"[ICVE] {url} 加载超时，尝试下一个...")
-                continue
-            except Exception as e:
-                print(f"[ICVE] {url} 异常: {e}")
-                continue
-
-        # 所有 URL 都失败，保存诊断信息
+        # 直接访问登录页面
         try:
-            html = await self._page.content()
-            with open(f"screenshots/icve_debug_{self._username}.html", "w", encoding="utf-8") as f:
-                f.write(html[:50000])
-            print(f"[ICVE] 诊断信息已保存到 screenshots/")
-        except Exception:
-            pass
+            print(f"[ICVE] 打开登录页面: https://mooc.icve.com.cn/login")
+            await self._page.goto(
+                "https://mooc.icve.com.cn/login",
+                wait_until="networkidle",
+                timeout=20000,
+            )
+            await asyncio.sleep(3)
 
-        return False
+            await self._page.screenshot(path=f"screenshots/icve_login_page_{self._username}.png")
+
+            if await self._try_login():
+                self._logged_in = True
+                return True
+
+            return False
+
+        except PlaywrightTimeout:
+            print(f"[ICVE] 登录页面加载超时")
+            return False
+        except Exception as e:
+            print(f"[ICVE] 登录异常: {e}")
+            return False
 
     async def _try_login(self) -> bool:
-        """在当前页面尝试登录流程"""
-        page_text = await self._page.text_content("body") or ""
-
-        # 判断当前页面类型：首页（需要先点登录按钮）vs 直接是登录页
-        has_login_form = any(kw in page_text for kw in ["密码", "登录", "password"])
-        has_login_btn = any(kw in page_text for kw in ["登录", "登录/注册"])
-
-        # 如果当前是首页，先点登录按钮打开登录弹窗/页面
-        if not has_login_form or has_login_btn:
-            print("[ICVE] 当前为首页，查找登录入口...")
-            click_targets = [
-                "text=登录",
-                "text=登录/注册",
-                'a:has-text("登录")',
-                'span:has-text("登录")',
-                '[class*="login"]',
-                '[class*="Login"]',
-            ]
-            clicked = False
-            for selector in click_targets:
-                try:
-                    el = self._page.locator(selector).first
-                    if await el.is_visible(timeout=1000):
-                        await el.click()
-                        print(f"[ICVE] 点击了 {selector}")
-                        clicked = True
-                        await asyncio.sleep(2)
-                        break
-                except Exception:
-                    continue
-
-            if not clicked:
-                print("[ICVE] 未找到登录入口按钮")
-
-        # 等待表单渲染
+        """在当前登录页面尝试账号密码登录"""
         await asyncio.sleep(2)
 
-        # 保存登录表单截图
         await self._page.screenshot(path=f"screenshots/icve_login_form_{self._username}.png")
 
         # 查找所有 input 元素
         all_inputs = await self._page.locator("input").all()
-        print(f"[ICVE] 页面找到 {len(all_inputs)} 个 input 元素")
+        print(f"[ICVE] 登录页找到 {len(all_inputs)} 个 input 元素")
         for i, inp in enumerate(all_inputs):
             try:
                 t = await inp.get_attribute("type") or ""
@@ -233,6 +188,29 @@ class IcveAdapter(BasePlatformAdapter):
 
         await human_wait(500, 200)
 
+        # 检测并识别验证码
+        captcha_input = None
+        for inp in all_inputs:
+            try:
+                ph = (await inp.get_attribute("placeholder") or "").lower()
+                t = (await inp.get_attribute("type") or "").lower()
+                if "验证码" in ph or "captcha" in ph or "code" in ph:
+                    captcha_input = inp
+                    break
+            except Exception:
+                continue
+
+        if captcha_input:
+            print("[ICVE] 检测到验证码输入框，尝试识别...")
+            captcha_solved = await self._recognize_captcha()
+            if captcha_solved:
+                await captcha_input.click()
+                await captcha_input.fill(captcha_solved)
+                print(f"[ICVE] 验证码识别结果: {captcha_solved}")
+                await human_wait(300, 100)
+            else:
+                print("[ICVE] 验证码识别失败，尝试直接提交")
+
         # 提交登录
         submit_selectors = [
             'button:has-text("登录")',
@@ -260,34 +238,171 @@ class IcveAdapter(BasePlatformAdapter):
             await self._page.keyboard.press("Enter")
             print("[ICVE] 通过 Enter 提交")
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
 
         # 验证登录结果
         await self._page.screenshot(path=f"screenshots/icve_after_login_{self._username}.png")
         current_url = self._page.url
-        body_text = (await self._page.text_content("body") or "")[:500]
+        body_text = (await self._page.evaluate("document.body.innerText") or "")[:1000]
 
-        # 检查错误提示
-        error_keywords = ["密码错误", "账号不存在", "验证码", "请正确输入"]
+        # 检查错误提示（包含"验证码"不算失败，可能是登录后页面残留）
+        error_keywords = ["密码错误", "账号不存在", "验证码错误", "验证码不正确", "请正确输入"]
         for kw in error_keywords:
             if kw in body_text:
+                # 排除"请输入验证码"（说明还没提交）和"记住密码"附近的"验证码"
+                if kw == "验证码" and "请输入验证码" not in body_text:
+                    continue
                 print(f"[ICVE] 登录失败: 检测到 '{kw}'")
                 return False
 
-        # 检查成功标志
-        success_keywords = ["退出", "个人中心", "我的课程", "课程列表", "学习中心"]
+        # 检查成功标志 - 更可靠的方式
+        success_keywords = ["退出", "个人中心", "我的课程", "课程列表", "学习中心", "智慧学习中心"]
         if any(kw in body_text for kw in success_keywords):
             print(f"[ICVE] 登录成功! URL: {current_url}")
             return True
 
-        # URL 变化也算成功
-        if current_url != self.LOGIN_URLS[0]:
-            print(f"[ICVE] URL 已变化，假设登录成功: {current_url}")
+        # 检查 Cookie 中是否有登录态
+        try:
+            cookies = await self._context.cookies()
+            has_session = any(
+                c["name"].lower() in ("token", "session", "sess", "jsessionid", "icve_token", "uid", "userid")
+                or "login" in c["name"].lower()
+                for c in cookies
+            )
+            if has_session:
+                print(f"[ICVE] 检测到登录 Cookie，登录成功")
+                return True
+        except Exception:
+            pass
+
+        # URL 变化到非 login 页面
+        if "/login" not in current_url.lower():
+            print(f"[ICVE] URL 已跳转到: {current_url}")
             return True
 
         print(f"[ICVE] 登录状态不明确，URL={current_url}, body前200字={body_text[:200]}")
-        # 如果没有明显错误，乐观认为成功
-        return "登录" not in body_text[:200]
+        return False
+
+    async def _recognize_captcha(self) -> str | None:
+        """识别验证码图片，使用 ddddocr 进行 OCR"""
+        try:
+            # 找到验证码图片元素
+            captcha_img = self._page.locator("img.login-code-img").first
+
+            # 通过 JS 强制点击/刷新验证码图片
+            await self._page.evaluate("""
+                () => {
+                    const img = document.querySelector('img.login-code-img');
+                    if (img) {
+                        // 尝试通过相邻元素或父元素点击
+                        const parent = img.parentElement;
+                        if (parent) parent.click();
+                        img.click();
+                    }
+                }
+            """)
+            await asyncio.sleep(1.5)
+
+            # 获取图片的 src（可能是通过 JS 动态设置）
+            src = await captcha_img.get_attribute("src") or ""
+
+            # 如果 src 仍是空，等待一下再试
+            if not src:
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    src = await captcha_img.get_attribute("src") or ""
+                    if src and len(src) > 20:
+                        break
+
+            # 如果还是空，尝试通过 JS 获取 background-image
+            if not src or len(src) <= 20:
+                src = await self._page.evaluate("""
+                    () => {
+                        const img = document.querySelector('img.login-code-img');
+                        if (!img) return '';
+                        // 检查 background-image
+                        const bg = window.getComputedStyle(img).backgroundImage;
+                        if (bg && bg.startsWith('url(')) {
+                            return bg.slice(5, -2); // 去掉 url(" 和 ")
+                        }
+                        return img.src || '';
+                    }
+                """)
+
+            print(f"[ICVE] 验证码 src: {src[:120]}")
+
+            if not src or len(src) <= 20:
+                # 最后尝试：截图整个验证码容器区域
+                box = await captcha_img.bounding_box()
+                if not box or box["width"] == 0:
+                    # 尝试父元素
+                    parent_box = await self._page.evaluate("""
+                        () => {
+                            const img = document.querySelector('img.login-code-img');
+                            const parent = img ? img.closest('.login-code, [class*=\"code\"], [class*=\"captcha\"]') : null;
+                            if (parent) {
+                                const r = parent.getBoundingClientRect();
+                                return {x: r.x, y: r.y, w: r.width, h: r.height};
+                            }
+                            return null;
+                        }
+                    """)
+                    if parent_box:
+                        box = {"x": parent_box["x"], "y": parent_box["y"],
+                               "width": parent_box["w"], "height": parent_box["h"]}
+
+                if box and box["width"] > 0:
+                    import io
+                    from PIL import Image
+                    screenshot_bytes = await self._page.screenshot()
+                    img = Image.open(io.BytesIO(screenshot_bytes))
+                    cropped = img.crop((
+                        int(box["x"]), int(box["y"]),
+                        int(box["x"] + box["width"]), int(box["y"] + box["height"]),
+                    ))
+                    buf = io.BytesIO()
+                    cropped.save(buf, format="PNG")
+                    img_bytes = buf.getvalue()
+                    ocr = ddddocr.DdddOcr(show_ad=False)
+                    result = ocr.classification(img_bytes)
+                    result = "".join(c for c in result if c.isalnum())
+                    print(f"[ICVE] 截图OCR结果: {result}")
+                    if result and len(result) >= 3:
+                        return result
+
+                print("[ICVE] 验证码图片未能加载")
+                return None
+
+            # 从 URL 获取图片字节
+            if src.startswith("data:"):
+                img_bytes = base64.b64decode(src.split(",", 1)[1])
+            else:
+                img_bytes = await self._page.evaluate("""
+                    async (url) => {
+                        const resp = await fetch(url);
+                        const blob = await resp.blob();
+                        return new Promise((resolve) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                            reader.readAsDataURL(blob);
+                        });
+                    }
+                """, src)
+                img_bytes = base64.b64decode(img_bytes)
+
+            ocr = ddddocr.DdddOcr(show_ad=False)
+            result = ocr.classification(img_bytes)
+            result = "".join(c for c in result if c.isalnum())
+            print(f"[ICVE] OCR 结果: {result}")
+            if result and len(result) >= 3:
+                return result
+            return None
+
+        except Exception as e:
+            print(f"[ICVE] 验证码识别异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     # ============================================================
     # 获取课程列表
@@ -319,22 +434,19 @@ class IcveAdapter(BasePlatformAdapter):
 
             await self._page.screenshot(path=f"screenshots/icve_courses_{self._username}.png")
 
-            # 使用 JavaScript 批量提取课程信息（比逐个 DOM 查询快 10 倍）
-            courses_raw = await self._page.evaluate("""
-                () => {
+            # 提取课程信息的内联 JS（避免重复）
+            extract_js = """
+                (prefix) => {
                     const courses = [];
-                    // 查找课程卡片
                     const cards = document.querySelectorAll('[class*="courseItem"], [class*="course-item"], [class*="courseCard"], [class*="course-card"], .el-card');
                     cards.forEach((card, idx) => {
                         const text = card.innerText || card.textContent || '';
                         const lines = text.split('\\n').filter(l => l.trim());
 
-                        // 提取课程名（通常是第一行或 h3 内的文本）
                         let name = '';
                         const h3 = card.querySelector('h3, h4, h5, [class*="title"], [class*="name"]');
                         if (h3) name = h3.innerText.trim();
                         if (!name && lines.length > 0) {
-                            // 过滤掉明显不是课程名的行
                             for (const l of lines) {
                                 if (l.length >= 4 && !/进行|已学|完成|继续|开始|进入|学习/.test(l)) {
                                     name = l; break;
@@ -343,7 +455,6 @@ class IcveAdapter(BasePlatformAdapter):
                             if (!name) name = lines[0] || '';
                         }
 
-                        // 提取教师
                         let teacher = '';
                         const tEl = card.querySelector('[class*="teacher"], [class*="author"], [class*="tutor"]');
                         if (tEl) teacher = tEl.innerText.trim();
@@ -353,8 +464,7 @@ class IcveAdapter(BasePlatformAdapter):
                             }
                         }
 
-                        // 提取课程链接中的 ID
-                        let courseId = 'icve_course_' + idx;
+                        let courseId = (prefix || 'icve_course_') + idx;
                         const link = card.querySelector('a[href]');
                         if (link) {
                             const href = link.getAttribute('href') || '';
@@ -366,7 +476,6 @@ class IcveAdapter(BasePlatformAdapter):
                             }
                         }
 
-                        // 封面图
                         let coverUrl = '';
                         const img = card.querySelector('img');
                         if (img) coverUrl = img.getAttribute('src') || '';
@@ -375,7 +484,10 @@ class IcveAdapter(BasePlatformAdapter):
                     });
                     return courses;
                 }
-            """)
+            """
+
+            # 1. 先抓取当前默认 Tab（职教课程）
+            courses_raw = await self._page.evaluate(extract_js, "icve_course_")
 
             for item in courses_raw:
                 name = (item.get("name") or "").strip()
@@ -387,9 +499,95 @@ class IcveAdapter(BasePlatformAdapter):
                     teacher=(item.get("teacher") or "").strip(),
                     cover_url=item.get("coverUrl") or "",
                 ))
-                print(f"[ICVE] {name[:60]} | {(item.get('teacher') or '')[:30]}")
+                print(f"[ICVE] 职教 | {name[:60]} | {(item.get('teacher') or '')[:30]}")
 
-            print(f"[ICVE] 共解析 {len(courses)} 门课程")
+            # 2. 切换到"MOOC课程"Tab，抓取用户自主加入的MOOC课程
+            mooc_clicked = await self._page.evaluate("""
+                () => {
+                    const all = document.querySelectorAll('.el-tabs__item, [class*="tab"], [role="tab"], span');
+                    for (const el of all) {
+                        const text = (el.innerText || '').trim();
+                        if (text === 'MOOC课程' || text === 'MOOC\u8bfe\u7a0b') {
+                            el.click();
+                            return 'clicked: ' + el.tagName;
+                        }
+                    }
+                    // 降级：匹配包含 MOOC 且长度较短的文本
+                    for (const el of all) {
+                        const text = (el.innerText || '').trim();
+                        if (text.includes('MOOC') && text.length <= 15) {
+                            el.click();
+                            return 'fuzzy_clicked: ' + text;
+                        }
+                    }
+                    return 'not_found';
+                }
+            """)
+            print(f"[ICVE] MOOC Tab 切换结果: {mooc_clicked}")
+
+            if "clicked" in str(mooc_clicked):
+                await asyncio.sleep(3)  # 等待 MOOC 课程列表加载
+                await self._page.screenshot(path=f"screenshots/icve_mooc_courses_{self._username}.png")
+
+                mooc_raw = await self._page.evaluate(extract_js, "icve_mooc_")
+                mooc_count = 0
+                for item in mooc_raw:
+                    name = (item.get("name") or "").strip()
+                    if not name or len(name) < 2:
+                        continue
+                    courses.append(CourseInfo(
+                        platform_course_id=item.get("courseId", f"icve_mooc_{len(courses)}"),
+                        name=name[:200],
+                        teacher=(item.get("teacher") or "").strip(),
+                        cover_url=item.get("coverUrl") or "",
+                    ))
+                    mooc_count += 1
+                    print(f"[ICVE] MOOC | {name[:60]} | {(item.get('teacher') or '')[:30]}")
+                print(f"[ICVE] MOOC 课程 {mooc_count} 门")
+
+            print(f"[ICVE] 共解析 {len(courses)} 门课程（职教 + MOOC）")
+
+            # 3. 访问个人中心，抓取"我加入的课程"
+            personal_urls = [
+                "https://mooc.icve.com.cn/learning/user/courses",
+                "https://mooc.icve.com.cn/user/courses",
+                "https://mooc.icve.com.cn/personal/courses",
+                "https://mooc.icve.com.cn/learning/personal",
+            ]
+            for purl in personal_urls:
+                try:
+                    await self._page.goto(purl, wait_until="networkidle", timeout=10000)
+                    await asyncio.sleep(4)
+                    body = await self._page.evaluate("document.body.innerText") or ""
+                    # 检查是否有"加入"、"我的课程"等关键词
+                    if any(kw in body for kw in ["加入", "我的课程", "已选", "形势", "MOOC"]):
+                        print(f"[ICVE] 个人中心课程页: {purl}")
+                        await self._page.screenshot(path=f"screenshots/icve_personal_{self._username}.png")
+                        personal_raw = await self._page.evaluate(extract_js, "icve_personal_")
+                        personal_count = 0
+                        existing_ids = {c.platform_course_id for c in courses}
+                        for item in personal_raw:
+                            name = (item.get("name") or "").strip()
+                            if not name or len(name) < 2:
+                                continue
+                            cid = item.get("courseId", f"icve_personal_{len(courses)}")
+                            if cid not in existing_ids:  # 去重
+                                courses.append(CourseInfo(
+                                    platform_course_id=cid,
+                                    name=name[:200],
+                                    teacher=(item.get("teacher") or "").strip(),
+                                    cover_url=item.get("coverUrl") or "",
+                                ))
+                                personal_count += 1
+                                existing_ids.add(cid)
+                                print(f"[ICVE] 个人中心 | {name[:60]} | {(item.get('teacher') or '')[:30]}")
+                        print(f"[ICVE] 个人中心课程 {personal_count} 门")
+                        if personal_count > 0:
+                            break  # 找到了就退出
+                except Exception:
+                    continue
+
+            print(f"[ICVE] 共解析 {len(courses)} 门课程（职教 + MOOC + 个人中心）")
             return courses
 
         except Exception as e:
@@ -840,6 +1038,166 @@ class IcveAdapter(BasePlatformAdapter):
             except Exception:
                 continue
         return False
+
+    # ============================================================
+    # 短信验证码登录（绕过图片验证码）
+    # ============================================================
+
+    async def send_sms_code(self) -> bool:
+        """发送短信验证码 — 通过首页弹窗"""
+        try:
+            if not self._playwright:
+                self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self._headless,
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1366, "height": 768}, locale="zh-CN",
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                )
+                self._page = await self._context.new_page()
+
+            # 首页弹窗登录
+            await self._page.goto("https://mooc.icve.com.cn/", wait_until="networkidle", timeout=15000)
+            await asyncio.sleep(4)
+
+            # 点击登录按钮
+            login_btn = self._page.locator('text=登录').first
+            if await login_btn.is_visible(timeout=2000):
+                await login_btn.click()
+                await asyncio.sleep(3)
+
+            # 填写手机号
+            phone_input = self._page.locator('input[placeholder*="手机号"]').first
+            if await phone_input.is_visible(timeout=2000):
+                await phone_input.fill(self._username)
+                print(f"[ICVE] SMS: 已填写手机号 {self._username}")
+            else:
+                print("[ICVE] SMS: 未找到手机号输入框")
+                return False
+
+            # 点击发送验证码按钮
+            send_btn_selectors = [
+                'button:has-text("发送")',
+                'span:has-text("发送")',
+                'text=发送验证码',
+                'text=获取验证码',
+                '[class*="send"]',
+                '[class*="get-code"]',
+            ]
+            for sel in send_btn_selectors:
+                try:
+                    btn = self._page.locator(sel).first
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click()
+                        print(f"[ICVE] SMS: 已点击发送验证码")
+                        await self._page.screenshot(path=f"screenshots/icve_sms_sent_{self._username}.png")
+                        return True
+                except Exception:
+                    continue
+
+            print("[ICVE] SMS: 未找到发送验证码按钮")
+            return False
+
+        except Exception as e:
+            print(f"[ICVE] send_sms_code 异常: {e}")
+            return False
+
+    async def login_with_sms(self, sms_code: str) -> bool:
+        """短信验证码登录"""
+        try:
+            # 填写验证码
+            code_input = self._page.locator('input[placeholder*="验证码"]').first
+            if await code_input.is_visible(timeout=2000):
+                await code_input.fill(sms_code)
+                print(f"[ICVE] SMS: 已填写验证码")
+            else:
+                print("[ICVE] SMS: 未找到验证码输入框")
+                return False
+
+            # 点击登录
+            submit_btn = self._page.locator('button:has-text("登录"), button:has-text("登 录")').first
+            if await submit_btn.is_visible(timeout=2000):
+                await submit_btn.click()
+                print(f"[ICVE] SMS: 已点击登录")
+                await asyncio.sleep(4)
+            else:
+                await self._page.keyboard.press("Enter")
+
+            # 验证登录结果
+            await self._page.screenshot(path=f"screenshots/icve_sms_result_{self._username}.png")
+            body = await self._page.evaluate("document.body.innerText") or ""
+            current_url = self._page.url
+
+            success_keywords = ["退出", "个人中心", "我的课程", "课程列表", "学习中心", "智慧学习中心"]
+            if any(kw in body for kw in success_keywords):
+                self._logged_in = True
+                print(f"[ICVE] SMS 登录成功!")
+                return True
+            if "/login" not in current_url.lower():
+                self._logged_in = True
+                print(f"[ICVE] SMS 登录成功 (URL跳转): {current_url}")
+                return True
+
+            print(f"[ICVE] SMS 登录失败: {body[:200]}")
+            return False
+
+        except Exception as e:
+            print(f"[ICVE] login_with_sms 异常: {e}")
+            return False
+
+    # ============================================================
+    # Cookie 管理
+    # ============================================================
+
+    async def export_cookies(self) -> str:
+        """导出 Cookie JSON"""
+        if not self._context:
+            return ""
+        try:
+            cookies = await self._context.cookies()
+            return json.dumps(cookies, ensure_ascii=False)
+        except Exception:
+            return ""
+
+    async def load_cookies(self, cookie_data: str) -> bool:
+        """加载 Cookie 恢复登录态"""
+        if not cookie_data:
+            return False
+        try:
+            if not self._playwright:
+                self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self._headless,
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1366, "height": 768}, locale="zh-CN",
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                )
+                self._page = await self._context.new_page()
+
+            cookies = json.loads(cookie_data)
+            await self._context.add_cookies(cookies)
+            print(f"[ICVE] 已加载 {len(cookies)} 个 Cookie")
+
+            # 验证 Cookie 是否有效
+            await self._page.goto("https://mooc.icve.com.cn/", wait_until="networkidle", timeout=15000)
+            await asyncio.sleep(3)
+            body = await self._page.evaluate("document.body.innerText") or ""
+
+            if any(kw in body for kw in ["退出", "个人中心", "我的课程", "学习中心"]):
+                self._logged_in = True
+                print("[ICVE] Cookie 有效，已恢复登录")
+                return True
+
+            print(f"[ICVE] Cookie 已过期: {body[:100]}")
+            return False
+
+        except Exception as e:
+            print(f"[ICVE] load_cookies 异常: {e}")
+            return False
 
     async def close(self):
         try:

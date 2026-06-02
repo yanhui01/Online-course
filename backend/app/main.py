@@ -1,5 +1,15 @@
 """FastAPI 应用入口"""
 
+import sys
+import os
+
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    # 在 Windows 上，Playwright 的子进程启动需要 ProactorEventLoop
+    # 强制设置环境变量确保所有子进程也使用正确的策略
+    os.environ["PYTHONASYNCIODEBUG"] = "0"
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI

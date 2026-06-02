@@ -12,7 +12,7 @@ asyncpg==0.30.0
 alembic==1.14.0
 
 # Redis & Task Queue
-redis==5.2.1
+redis>=4.2.0,<5
 arq==0.26.0
 
 # Auth
@@ -40,6 +40,9 @@ websockets==14.1
 
 # Utils
 python-dateutil==2.9.0.post0
+
+# Captcha OCR
+ddddocr==1.5.6
 
 # Dev
 pytest==8.3.4

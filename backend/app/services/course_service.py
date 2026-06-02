@@ -2,6 +2,7 @@
 
 import asyncio
 import traceback
+from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
@@ -84,21 +85,38 @@ async def _do_sync(
     )
 
     try:
-        # 登录：SMS模式用Cookie恢复，密码模式走正常登录
+        # 登录：有 Cookie 优先用 Cookie 恢复，否则走密码登录
         _sync_tasks[account_id] = {"status": "running", "message": "正在登录..."}
 
-        if login_type == "sms" and cookie_data:
+        if cookie_data:
             decrypted_cookie = decrypt_optional(cookie_data)
             cookie_ok = await adapter.load_cookies(decrypted_cookie or "")
             if cookie_ok:
                 adapter._logged_in = True
                 _sync_tasks[account_id] = {"status": "running", "message": "Cookie登录成功，正在获取课程..."}
-            else:
+            elif login_type in ("sms", "qrcode"):
+                # SMS/扫码模式无密码可回退，直接失败
                 _sync_tasks[account_id] = {
                     "status": "error",
-                    "message": "Cookie 已过期，请重新验证短信",
+                    "message": "Cookie 已过期，请重新验证短信或扫码登录",
                 }
                 return
+            else:
+                # password 模式：Cookie 失败，回退到密码登录
+                # load_cookies() 已创建 browser，需要先关闭再用新 adapter 执行 login()
+                _sync_tasks[account_id] = {"status": "running", "message": "Cookie失效，尝试密码登录..."}
+                await adapter.close()
+                adapter = get_adapter(
+                    platform=platform, username=account_name,
+                    password=password or "", headless=True,
+                )
+                login_ok = await asyncio.wait_for(adapter.login(), timeout=90)
+                if not login_ok:
+                    _sync_tasks[account_id] = {
+                        "status": "error",
+                        "message": f"{platform_label} 登录失败，请检查账号密码或重新扫码",
+                    }
+                    return
         else:
             login_ok = await asyncio.wait_for(adapter.login(), timeout=90)
             if not login_ok:
@@ -107,6 +125,21 @@ async def _do_sync(
                     "message": f"{platform_label} 登录失败，请检查账号密码",
                 }
                 return
+
+        # 登录成功，保存 Cookie 供下次使用
+        try:
+            cookie_data = await adapter.export_cookies()
+            if cookie_data:
+                async with async_session_factory() as save_db:
+                    acct = await save_db.get(PlatformAccount, account_id)
+                    if acct:
+                        from app.core.crypto import encrypt
+                        acct.cookie_data = encrypt(cookie_data)
+                        acct.last_login_at = datetime.now(timezone.utc)
+                        await save_db.commit()
+                        print(f"[sync] 已保存 {platform} Cookie")
+        except Exception as e:
+            print(f"[sync] 保存 Cookie 失败: {e}")
 
         # 获取课程（最多等待 30 秒）
         _sync_tasks[account_id] = {"status": "running", "message": "正在获取课程列表..."}
@@ -241,6 +274,7 @@ async def get_course_detail(db: AsyncSession, user_id: str, course_id: str) -> C
                     platform_course_id=course.platform_course_id,
                     account_name=account.account_name,
                     encrypted_password=account.encrypted_password,
+                    cookie_data=account.cookie_data,
                 )
             )
 
@@ -253,13 +287,29 @@ async def _sync_sections(
     platform_course_id: str,
     account_name: str,
     encrypted_password: str | None,
+    cookie_data: str | None = None,
 ):
     """后台同步单个课程的章节"""
     password = decrypt_optional(encrypted_password)
     adapter = get_adapter(platform=platform, username=account_name, password=password or "")
 
     try:
-        await asyncio.wait_for(adapter.login(), timeout=30)
+        # 有 Cookie 优先用 Cookie 恢复，否则走密码登录
+        if cookie_data:
+            decrypted_cookie = decrypt_optional(cookie_data)
+            cookie_ok = await adapter.load_cookies(decrypted_cookie or "")
+            if cookie_ok:
+                adapter._logged_in = True
+            else:
+                # Cookie 失败，回退到密码登录
+                await adapter.close()
+                adapter = get_adapter(
+                    platform=platform, username=account_name,
+                    password=password or "", headless=True,
+                )
+                await asyncio.wait_for(adapter.login(), timeout=30)
+        else:
+            await asyncio.wait_for(adapter.login(), timeout=30)
         sections_infos = await asyncio.wait_for(
             adapter.get_sections(platform_course_id), timeout=30
         )
